@@ -1,220 +1,3 @@
-import os
-
-dataset_path = r"D:\My_Projects\Fake_Image_Detection\Dataset"  # Use raw string (r"") to avoid escape character issues
-
-print("Dataset Exists:", os.path.exists(dataset_path))
-print("Training Folder Exists:", os.path.exists(os.path.join(dataset_path, "Train")))
-print("Validation Folder Exists:", os.path.exists(os.path.join(dataset_path, "validation")))
-print("Testing Folder Exists:", os.path.exists(os.path.join(dataset_path, "Test")))
-
-# List contents of dataset directory
-print("Dataset Contents:", os.listdir(dataset_path) if os.path.exists(dataset_path) else "Folder not found")
-
-
-
-import tensorflow as tf
-import tensorflow_addons as tfa
-import sys
-import tensorflow_probability as tfp
-import tensorflow.keras as keras
-
-print("Python executable:", sys.executable)
-print("TensorFlow version:", tf.__version__)
-print("TensorFlow path:", tf.__file__)
-print("TensorFlow Addons version:", tfa.__version__)
-print("TensorFlow Addons path:", tfa.__file__)
-print("TensorFlow probability version:", tfp.__version__)
-print("TensorFlow probability path:", tfp.__file__)
-
-
-//
-//Python executable: C:\Users\nrvis\deepfake\venv\Scripts\python.exe
-TensorFlow version: 2.14.0
-TensorFlow path: C:\Users\nrvis\deepfake\venv\Lib\site-packages\tensorflow\__init__.py
-TensorFlow Addons version: 0.22.0
-TensorFlow Addons path: C:\Users\nrvis\deepfake\venv\Lib\site-packages\tensorflow_addons\__init__.py
-TensorFlow probability version: 0.22.1
-TensorFlow probability path: C:\Users\nrvis\deepfake\venv\Lib\site-packages\tensorflow_probability\__init__.py//
-//
-
-
-import os
-import tensorflow as tf
-import tensorflow_addons as tfa
-import numpy as np
-from tensorflow.keras.applications import EfficientNetB7
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
-from tensorflow.keras.regularizers import l2
-
-# === Setup ===
-dataset_path = r"D:\My_Projects\Fake_Image_Detection\Dataset"
-train_dir = os.path.join(dataset_path, "Train")
-val_dir = os.path.join(dataset_path, "validation")
-test_dir = os.path.join(dataset_path, "Test")
-
-IMG_SIZE = (256, 256)
-BATCH_SIZE = 32
-AUTOTUNE = tf.data.AUTOTUNE
-NUM_CLASSES = len(os.listdir(train_dir))
-
-# === Data Load ===
-def preprocess(image, label):
-    image = tf.image.resize(image, IMG_SIZE)
-    image = tf.cast(image, tf.float32) / 255.0
-    return image, label
-
-def load_dataset(directory, training=False):
-    ds = tf.keras.preprocessing.image_dataset_from_directory(
-        directory,
-        label_mode="categorical",
-        image_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        shuffle=training
-    )
-    ds = ds.map(preprocess, num_parallel_calls=AUTOTUNE)
-    if training:
-        ds = ds.map(cutmix_batch, num_parallel_calls=AUTOTUNE)
-    return ds.prefetch(AUTOTUNE)
-
-# === CutMix Augmentation ===
-def cutmix_batch(images, labels):
-    lam = tf.random.uniform([], 0, 1)
-    batch_size = tf.shape(images)[0]
-
-    # Shuffle and get paired images
-    indices = tf.random.shuffle(tf.range(batch_size))
-    shuffled_images = tf.gather(images, indices)
-    shuffled_labels = tf.gather(labels, indices)
-
-    # CutMix box
-    image_height, image_width = IMG_SIZE
-    cut_rat = tf.math.sqrt(1.0 - lam)
-    cut_w = tf.cast(image_width * cut_rat, tf.int32)
-    cut_h = tf.cast(image_height * cut_rat, tf.int32)
-
-    cx = tf.random.uniform([], 0, image_width, dtype=tf.int32)
-    cy = tf.random.uniform([], 0, image_height, dtype=tf.int32)
-
-    x1 = tf.clip_by_value(cx - cut_w // 2, 0, image_width)
-    y1 = tf.clip_by_value(cy - cut_h // 2, 0, image_height)
-    x2 = tf.clip_by_value(cx + cut_w // 2, 0, image_width)
-    y2 = tf.clip_by_value(cy + cut_h // 2, 0, image_height)
-
-    # Create mask and apply CutMix
-    mask = tf.ones((y2 - y1, x2 - x1, 3))
-    pad_left = x1
-    pad_top = y1
-    pad_right = image_width - x2
-    pad_bottom = image_height - y2
-    mask = tf.pad(mask, [[pad_top, pad_bottom], [pad_left, pad_right], [0, 0]])
-
-    mask = tf.cast(mask, tf.float32)
-    images = images * (1 - mask) + shuffled_images * mask
-    lam = 1 - tf.cast((x2 - x1) * (y2 - y1), tf.float32) / tf.cast(image_width * image_height, tf.float32)
-    labels = lam * labels + (1 - lam) * shuffled_labels
-
-    return images, labels
-
-# === Datasets ===
-train_ds = load_dataset(train_dir, training=True)
-val_ds = load_dataset(val_dir)
-test_ds = load_dataset(test_dir)
-
-# === Model ===
-base_model = EfficientNetB7(weights="imagenet", include_top=False, input_shape=(256, 256, 3))
-base_model.trainable = False
-
-x = base_model.output
-x = GlobalAveragePooling2D()(x)
-x = BatchNormalization()(x)
-x = Dropout(0.5)(x)
-x = Dense(256, activation='relu', kernel_regularizer=l2(0.001))(x)
-x = Dropout(0.3)(x)
-outputs = Dense(NUM_CLASSES, activation='softmax')(x)
-
-model = Model(inputs=base_model.input, outputs=outputs)
-
-# === Loss + Optimizer ===
-def focal_loss(y_true, y_pred):
-    fl = tfa.losses.SigmoidFocalCrossEntropy(alpha=0.25, gamma=2.0)
-    return tf.reduce_mean(fl(y_true, y_pred))
-
-early_stopping = tf.keras.callbacks.EarlyStopping(
-    monitor="val_loss",
-    patience=10,
-    restore_best_weights=True
-)
-
-model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
-    "best_model.h5",
-    monitor="val_loss",
-    save_best_only=True
-)
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-    loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
-    metrics=["accuracy"]
-)
-
-model.fit(
-    train_ds,
-    epochs=20,
-    validation_data=val_ds,
-    callbacks=[early_stopping, model_checkpoint],
-    verbose=1  # ✅ This shows a progress bar
-)
-
-
-# === Evaluation ===
-test_loss, test_acc = model.evaluate(test_ds, verbose=2)
-print(f"Test Accuracy: {test_acc * 100:.2f}%")
-
-
-
-
-
-for layer in base_model.layers[-200:]:
-    layer.trainable = True
-
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6),
-    loss=loss,
-    metrics=["accuracy"]
-)
-
-fine_tune_history = model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=20,
-    callbacks=[early_stopping]
-)
-
-test_loss, test_acc = model.evaluate(test_ds)
-print(f"Fine-tuned Test Accuracy: {test_acc * 100:.2f}%")
-
-
-
-
-
-def tta_prediction(model, img):
-    img = tf.image.resize(img, IMG_SIZE)
-    img = tf.cast(img, tf.float32) / 255.0
-    augmented_images = [
-        img,
-        tf.image.flip_left_right(img),
-        tf.image.rot90(img)
-    ]
-    preds = [model.predict(tf.expand_dims(i, axis=0)) for i in augmented_images]
-    return np.mean(preds, axis=0)
-
-print("Model trained with tf.data, CutMix, MixUp, focal loss, and fine-tuning!")
-
-model.save(r"D:\My_Projects\Fake_Image_Detection\deepfake_detector.h5")
-model.save(r"D:\My_Projects\Fake_Image_Detection\deepfake_detector_saved_model")
-
-
--=====================---------------------=======================-----------------------==========================-----------------------=====================-----------------
 # 📦 Imports & Dataset Paths
 import os
 import tensorflow as tf
@@ -224,6 +7,7 @@ from tensorflow.keras.applications import EfficientNetB7
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
 from tensorflow.keras.regularizers import l2
+import matplotlib.pyplot as plt
 
 # === Dataset Paths ===
 dataset_path = r"D:\My_Projects\Fake_Image_Detection\Dataset"
@@ -236,14 +20,17 @@ BATCH_SIZE = 32
 AUTOTUNE = tf.data.AUTOTUNE
 NUM_CLASSES = len(os.listdir(train_dir))
 
-# 🧼 Preprocessing and Augmentations
+print(f"📊 Number of classes: {NUM_CLASSES}")
+print(f"📁 Classes found: {os.listdir(train_dir)}")
 
+# 🧼 Preprocessing and Augmentations
 def preprocess(image, label):
-    image = tf.image.resize(image, IMG_SIZE)
+    """Basic preprocessing: normalize to [0,1]"""
     image = tf.cast(image, tf.float32) / 255.0
     return image, label
 
 def cutmix(images, labels):
+    """CutMix augmentation"""
     lam = tf.random.uniform([], 0, 1)
     batch_size = tf.shape(images)[0]
     indices = tf.random.shuffle(tf.range(batch_size))
@@ -270,6 +57,7 @@ def cutmix(images, labels):
     return images, labels
 
 def mixup(images, labels, alpha=0.2):
+    """MixUp augmentation"""
     lam = tf.random.uniform([], 0, 1)
     indices = tf.random.shuffle(tf.range(tf.shape(images)[0]))
     shuffled_images = tf.gather(images, indices)
@@ -279,13 +67,16 @@ def mixup(images, labels, alpha=0.2):
     return images, labels
 
 def apply_augmentation(images, labels):
-    do_cutmix = tf.random.uniform([]) > 0.5
-    return tf.cond(do_cutmix, lambda: cutmix(images, labels), lambda: mixup(images, labels))
+    """Apply either CutMix or MixUp randomly"""
+    def cutmix_fn(): return cutmix(images, labels)
+    def mixup_fn(): return mixup(images, labels)
+    return tf.cond(tf.random.uniform([]) > 0.5, cutmix_fn, mixup_fn)
 
-
-# 📂 Load Datasets
+# 📂 Load Datasets with Conditional Augmentation
+augment = tf.Variable(False, trainable=False, dtype=tf.bool)
 
 def load_dataset(directory, training=False):
+    """Load dataset with conditional augmentation"""
     ds = tf.keras.preprocessing.image_dataset_from_directory(
         directory,
         label_mode="categorical",
@@ -295,148 +86,295 @@ def load_dataset(directory, training=False):
     )
     ds = ds.map(preprocess, num_parallel_calls=AUTOTUNE)
     if training:
-        ds = ds.map(apply_augmentation, num_parallel_calls=AUTOTUNE)
+        def conditional_aug(images, labels):
+            return tf.cond(
+                augment,
+                lambda: apply_augmentation(images, labels),
+                lambda: (images, labels)
+            )
+        ds = ds.map(conditional_aug, num_parallel_calls=AUTOTUNE)
     return ds.prefetch(AUTOTUNE)
 
 train_ds = load_dataset(train_dir, training=True)
 val_ds = load_dataset(val_dir)
 test_ds = load_dataset(test_dir)
 
-
 # 🧠 Model Setup with Resume from Checkpoint
+checkpoint_path = "D:/My_Projects/Fake_Image_Detection/checkpoint_model.h5"
 
-focal_loss = tfa.losses.SigmoidFocalCrossEntropy(alpha=0.25, gamma=2.0)
-checkpoint_path = "D:\My_Projects\Fake_Image_Detection\checkpoint_model.keras"
-
+# ✅ Fix 1: Use sigmoid activation with focal loss
 if os.path.exists(checkpoint_path):
     print("🔁 Resuming from saved checkpoint...")
-    model = tf.keras.models.load_model(checkpoint_path, custom_objects={"SigmoidFocalCrossEntropy": tfa.losses.SigmoidFocalCrossEntropy})
+    model = tf.keras.models.load_model(
+        checkpoint_path,
+        custom_objects={"SigmoidFocalCrossEntropy": tfa.losses.SigmoidFocalCrossEntropy}
+    )
 else:
     print("🆕 Training from scratch...")
     base_model = EfficientNetB7(weights="imagenet", include_top=False, input_shape=(256, 256, 3))
-    base_model.trainable = False
+    base_model.trainable = False  # Will be unfrozen later
 
     x = base_model.output
     x = GlobalAveragePooling2D()(x)
     x = BatchNormalization()(x)
     x = Dropout(0.5)(x)
-    x = Dense(256, activation='relu', kernel_regularizer=l2(0.001))(x)
+    x = Dense(512, activation='relu', kernel_regularizer=l2(0.001))(x)  # Increased units
+    x = BatchNormalization()(x)  # Added extra BN
     x = Dropout(0.3)(x)
-    outputs = Dense(NUM_CLASSES, activation='softmax')(x)
+    x = Dense(256, activation='relu', kernel_regularizer=l2(0.001))(x)  # Added extra layer
+    x = Dropout(0.2)(x)
+    outputs = Dense(NUM_CLASSES, activation='sigmoid')(x)  # ✅ SIGMOID instead of softmax
     model = Model(inputs=base_model.input, outputs=outputs)
 
+# ✅ Fix 2: Proper focal loss implementation
+focal_loss_fn = tfa.losses.SigmoidFocalCrossEntropy(alpha=0.25, gamma=2.0)
 
-# 🛠️ Compile and Initial Training
+def focal_loss(y_true, y_pred):
+    """Wrapper for focal loss to ensure scalar output"""
+    loss = focal_loss_fn(y_true, y_pred)
+    return tf.reduce_mean(loss)
 
-early_stopping = tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True, monitor="val_loss")
+# 🎯 Enhanced Callbacks
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    patience=15,  # Increased patience
+    restore_best_weights=True, 
+    monitor="val_loss",
+    verbose=1
+)
 
 lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
     monitor='val_loss',
-    factor=0.5,
-    patience=5,
+    factor=0.3,  # More aggressive reduction
+    patience=7,
     verbose=1,
-    min_lr=1e-7
+    min_lr=1e-8
 )
 
 model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
     filepath=checkpoint_path,
     monitor="val_loss",
     save_best_only=True,
-    save_weights_only=False
+    save_weights_only=False,
+    verbose=1
 )
 
+# ✅ Fix 3: Advanced Fine-tuning Callback
+class AdvancedFineTuneCallback(tf.keras.callbacks.Callback):
+    def __init__(self, unfreeze_epoch=5, enable_aug_epoch=8):
+        super().__init__()
+        self.unfreeze_epoch = unfreeze_epoch
+        self.enable_aug_epoch = enable_aug_epoch
+        self.base_model = None
+        
+        # Find the base model
+        for layer in model.layers:
+            if isinstance(layer, tf.keras.applications.EfficientNet):
+                self.base_model = layer
+                break
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if epoch == self.unfreeze_epoch and self.base_model:
+            print(f"🔓 Unfreezing top 200 layers of EfficientNetB7 at epoch {epoch}")
+            self.base_model.trainable = True
+            # Freeze bottom layers, unfreeze top 200
+            for layer in self.base_model.layers[:-200]:
+                layer.trainable = False
+            # Recompile with lower learning rate
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(1e-5),  # Lower LR for fine-tuning
+                loss=focal_loss,
+                metrics=["accuracy", "precision", "recall"]
+            )
+            print("✅ Model recompiled with unfrozen layers")
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch == self.enable_aug_epoch:
+            print("🎨 Enabling CutMix/MixUp from epoch 9 onward.")
+            augment.assign(True)
+
+# 📊 Training History Tracking
+class TrainingHistoryCallback(tf.keras.callbacks.Callback):
+    def __init__(self):
+        super().__init__()
+        self.history = {'loss': [], 'val_loss': [], 'accuracy': [], 'val_accuracy': []}
+    
+    def on_epoch_end(self, epoch, logs=None):
+        for key in self.history.keys():
+            if key in logs:
+                self.history[key].append(logs[key])
+        
+        # Print epoch summary
+        print(f"Epoch {epoch+1}: Loss={logs['loss']:.4f}, Val_Loss={logs['val_loss']:.4f}, "
+              f"Acc={logs['accuracy']:.4f}, Val_Acc={logs['val_accuracy']:.4f}")
+
+history_callback = TrainingHistoryCallback()
+fine_tune_callback = AdvancedFineTuneCallback(unfreeze_epoch=5, enable_aug_epoch=8)
+
+# 🚀 Initial Training Phase
+print("🚀 Starting initial training phase...")
 model.compile(
     optimizer=tf.keras.optimizers.Adam(1e-4),
     loss=focal_loss,
-    metrics=["accuracy"]
+    metrics=["accuracy", "precision", "recall"]
 )
 
-model.fit(
+# Train with frozen base model
+history = model.fit(
     train_ds,
     validation_data=val_ds,
     epochs=20,
-    callbacks=[early_stopping, model_checkpoint, lr_scheduler]
+    callbacks=[
+        early_stopping, 
+        model_checkpoint, 
+        lr_scheduler, 
+        fine_tune_callback,
+        history_callback
+    ],
+    verbose=1
 )
 
+# 📈 Plot Training History
+def plot_training_history(history):
+    """Plot training and validation metrics"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Loss
+    axes[0, 0].plot(history.history['loss'], label='Training Loss')
+    axes[0, 0].plot(history.history['val_loss'], label='Validation Loss')
+    axes[0, 0].set_title('Model Loss')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    
+    # Accuracy
+    axes[0, 1].plot(history.history['accuracy'], label='Training Accuracy')
+    axes[0, 1].plot(history.history['val_accuracy'], label='Validation Accuracy')
+    axes[0, 1].set_title('Model Accuracy')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Accuracy')
+    axes[0, 1].legend()
+    
+    # Precision
+    axes[1, 0].plot(history.history['precision'], label='Training Precision')
+    axes[1, 0].plot(history.history['val_precision'], label='Validation Precision')
+    axes[1, 0].set_title('Model Precision')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Precision')
+    axes[1, 0].legend()
+    
+    # Recall
+    axes[1, 1].plot(history.history['recall'], label='Training Recall')
+    axes[1, 1].plot(history.history['val_recall'], label='Validation Recall')
+    axes[1, 1].set_title('Model Recall')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Recall')
+    axes[1, 1].legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+    plt.show()
 
-# 🔓 Fine-Tuning
+# Plot history if training completed
+if len(history.history['loss']) > 0:
+    plot_training_history(history)
 
-for layer in model.layers[-200:]:
-    layer.trainable = True
+# 📊 Enhanced Evaluation with TTA
+print("\n📊 Evaluating model performance...")
+test_loss, test_acc, test_precision, test_recall = model.evaluate(test_ds, verbose=2)
+print(f"Test Accuracy: {test_acc * 100:.2f}%")
+print(f"Test Precision: {test_precision * 100:.2f}%")
+print(f"Test Recall: {test_recall * 100:.2f}%")
 
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(1e-6),
-    loss=focal_loss,
-    metrics=["accuracy"]
-)
-
-model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=20,
-    callbacks=[early_stopping, lr_scheduler]
-)
-
-
-# 📊 Evaluation and TTA
-
-test_loss, test_acc = model.evaluate(test_ds, verbose=2)
-print(f"Test Accuracy (Final): {test_acc * 100:.2f}%")
-
-def tta_prediction(model, img):
+def enhanced_tta_prediction(model, img, num_augmentations=5):
+    """Enhanced TTA with more augmentations"""
     img = tf.image.resize(img, IMG_SIZE)
     img = tf.cast(img, tf.float32) / 255.0
+    
     augmented_images = [
         img,
         tf.image.flip_left_right(img),
-        tf.image.rot90(img)
+        tf.image.flip_up_down(img),
+        tf.image.rot90(img),
+        tf.image.rot90(img, k=2),
+        tf.image.rot90(img, k=3),
+        tf.image.adjust_brightness(img, 0.1),
+        tf.image.adjust_brightness(img, -0.1),
+        tf.image.adjust_contrast(img, 1.1),
+        tf.image.adjust_contrast(img, 0.9)
     ]
-    preds = [model.predict(tf.expand_dims(i, axis=0), verbose=0) for i in augmented_images]
+    
+    # Use only the first num_augmentations
+    augmented_images = augmented_images[:num_augmentations]
+    
+    preds = []
+    for aug_img in augmented_images:
+        pred = model.predict(tf.expand_dims(aug_img, axis=0), verbose=0)
+        preds.append(pred)
+    
     return np.mean(preds, axis=0)
 
+# Enhanced TTA Evaluation
+print("\n🎯 Running Enhanced TTA Evaluation...")
 correct = 0
 total = 0
+tta_predictions = []
+tta_true_labels = []
+
 for img, label in test_ds.unbatch():
-    pred = tta_prediction(model, img)
+    pred = enhanced_tta_prediction(model, img, num_augmentations=7)
+    tta_predictions.append(pred)
+    tta_true_labels.append(label.numpy())
+    
     if np.argmax(pred) == np.argmax(label.numpy()):
         correct += 1
     total += 1
-print(f"TTA Accuracy: {(correct / total) * 100:.2f}%")
 
+tta_accuracy = (correct / total) * 100
+print(f"Enhanced TTA Accuracy: {tta_accuracy:.2f}%")
+
+# 📊 Confusion Matrix and Detailed Metrics
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+
+# Convert predictions and labels
+y_pred = np.argmax(tta_predictions, axis=1)
+y_true = np.argmax(tta_true_labels, axis=1)
+
+# Get class names
+class_names = sorted(os.listdir(train_dir))
+
+# Print classification report
+print("\n📋 Classification Report:")
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+# Plot confusion matrix
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=class_names, yticklabels=class_names)
+plt.title('Confusion Matrix')
+plt.ylabel('True Label')
+plt.xlabel('Predicted Label')
+plt.tight_layout()
+plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+plt.show()
 
 # 💾 Save Final Model
-
+print("\n💾 Saving final model...")
 model.save(r"D:\My_Projects\Fake_Image_Detection\deepfake_detector.h5")
 model.save(r"D:\My_Projects\Fake_Image_Detection\deepfake_detector_saved_model")
 
+# Save training history
+import json
+with open('training_history.json', 'w') as f:
+    json.dump(history.history, f)
+
 print("✅ Model training complete and saved successfully!")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+print(f"🎯 Final TTA Accuracy: {tta_accuracy:.2f}%")
+print("📁 Files saved:")
+print("  - deepfake_detector.h5")
+print("  - deepfake_detector_saved_model/")
+print("  - training_history.png")
+print("  - confusion_matrix.png")
+print("  - training_history.json")
 
